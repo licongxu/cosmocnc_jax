@@ -1,19 +1,6 @@
+theory: null
 likelihood:
   cobaya_planck_scatter_jax.CNCBinnedPlanckScatterLikelihood:
-    input_params:
-    - H0
-    - ln10_10A_s
-    - n_s
-    - omega_b
-    - Omega_m
-    - omega_cdm
-    - tau_reio
-    - m_nu
-    - one_minus_b
-    - B
-    - A_SZ
-    - alpha_SZ
-    - sigma_lnY
     data_file: /scratch/scratch-lxu/tsz_cnc_scatter/synthetic_data/N2d_z_q_bin_scatter.txt
     survey_sr: /scratch/scratch-lxu/agent_dev/auto_research_agent/cosmocnc_jax/.claude/worktrees/hmfast-cobaya/cosmocnc_jax/surveys/survey_sr_planck_sim.py
     survey_cat: /scratch/scratch-lxu/agent_dev/auto_research_agent/cosmocnc_jax/.claude/worktrees/hmfast-cobaya/cosmocnc_jax/surveys/survey_cat_planck_sim.py
@@ -32,7 +19,26 @@ likelihood:
     M_max: 1.0e+16
     f_sky: 1.0
     M_pivot: 210000000000000.0
-    cosmology_tool: classy_sz_jax
+    cosmology_tool: hmfast
+    type: []
+    speed: -1
+    stop_at_error: false
+    version: null
+    input_params:
+    - H0
+    - ln10_10A_s
+    - n_s
+    - omega_b
+    - Omega_m
+    - omega_cdm
+    - tau_reio
+    - m_nu
+    - one_minus_b
+    - B
+    - A_SZ
+    - alpha_SZ
+    - sigma_lnY
+    output_params: []
 params:
   H0:
     prior:
@@ -84,6 +90,7 @@ params:
     proposal: 0.02
   omega_cdm:
     value: 'lambda Omega_m, H0, omega_b: Omega_m * (H0 / 100.0)**2 - omega_b'
+    derived: true
   tau_reio:
     value: 0.0544
   m_nu:
@@ -92,6 +99,7 @@ params:
     value: 0.709
   B:
     value: 'lambda one_minus_b: 1.0 / one_minus_b'
+    derived: true
   A_SZ:
     prior:
       min: -4.41
@@ -122,13 +130,46 @@ params:
     proposal: 0.01
 sampler:
   mcmc:
-    Rminus1_stop: 0.05
     burn_in: 50
     max_tries: 100000
-    learn_proposal: true
-    learn_every: 40
+    covmat: null
+    covmat_params: null
     proposal_scale: 1.2
+    output_every: 60s
+    learn_every: 40
+    temperature: 1
+    learn_proposal: true
+    learn_proposal_Rminus1_max: 2.0
+    learn_proposal_Rminus1_max_early: 30.0
+    learn_proposal_Rminus1_min: 0.0
+    max_samples: .inf
+    Rminus1_stop: 0.05
+    Rminus1_cl_stop: 0.2
+    Rminus1_cl_level: 0.95
+    Rminus1_single_split: 4
+    measure_speeds: true
+    oversample_power: 0.4
+    oversample_thin: true
     drag: false
-output: cnc_planck_scatter_jax
+    blocking:
+    - - 1
+      - - H0
+        - ln10_10A_s
+        - n_s
+        - omega_b
+        - Omega_m
+        - A_SZ
+        - alpha_SZ
+        - sigma_lnY
+    callback_function: null
+    callback_every: null
+    seed: null
+    check_every: null
+    oversample: null
+    drag_limits: null
+    fallback_covmat_scale: 4
+    version: 3.5.7
+output: cnc_planck_scatter_hmfast
 logging_level: 30
 timing: true
+version: 3.5.7

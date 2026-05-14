@@ -69,6 +69,7 @@ class CNCBinnedPlanckScatterLikelihood(Likelihood):
     M_max: float = 1.0e16
     f_sky: float = 1.0
     M_pivot: float = 3.0 * 0.7e14
+    cosmology_tool: str = "hmfast"
 
     def initialize(self):
         self.n_obs = np.loadtxt(self.data_file, dtype=float)
@@ -109,7 +110,7 @@ class CNCBinnedPlanckScatterLikelihood(Likelihood):
         cnc_params["M_max"] = float(self.M_max)
         cnc_params["planck_sim_M_pivot"] = float(self.M_pivot)
 
-        cnc_params["cosmology_tool"] = "hmfast"
+        cnc_params["cosmology_tool"] = self.cosmology_tool
         cnc_params["hmf_calc"] = "cnc"
         cnc_params["cosmo_param_density"] = "physical"
         cnc_params["cosmo_amplitude_parameter"] = "A_s"

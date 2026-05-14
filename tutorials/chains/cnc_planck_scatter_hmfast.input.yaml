@@ -32,7 +32,7 @@ likelihood:
     M_max: 1.0e+16
     f_sky: 1.0
     M_pivot: 210000000000000.0
-    cosmology_tool: classy_sz_jax
+    cosmology_tool: hmfast
 params:
   H0:
     prior:
@@ -129,6 +129,6 @@ sampler:
     learn_every: 40
     proposal_scale: 1.2
     drag: false
-output: cnc_planck_scatter_jax
+output: cnc_planck_scatter_hmfast
 logging_level: 30
 timing: true

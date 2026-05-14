@@ -109,7 +109,7 @@ class CNCBinnedPlanckScatterLikelihood(Likelihood):
         cnc_params["M_max"] = float(self.M_max)
         cnc_params["planck_sim_M_pivot"] = float(self.M_pivot)
 
-        cnc_params["cosmology_tool"] = "classy_sz_jax"
+        cnc_params["cosmology_tool"] = "hmfast"
         cnc_params["hmf_calc"] = "cnc"
         cnc_params["cosmo_param_density"] = "physical"
         cnc_params["cosmo_amplitude_parameter"] = "A_s"

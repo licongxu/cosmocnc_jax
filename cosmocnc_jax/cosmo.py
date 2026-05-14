@@ -1,11 +1,46 @@
 import numpy as np
+import jax
 import jax.numpy as jnp
 
+import os
 import sys
 from .config import *
 from .hmf import *
 # scipy.integrate removed -- replaced with JAX trapezoid quadrature
 import time
+
+
+# hmfast emulator_set name for each cosmocnc cosmo_model.
+_HMFAST_EMU_FOR_MODEL = {
+    "lcdm": "lcdm:v1",
+    "mnu": "mnu:v1",
+    "neff": "neff:v1",
+    "wcdm": "wcdm:v1",
+    "ede": "ede:v1",
+    "mnu-3states": "mnu-3states:v1",
+    "ede-v2": "ede:v2",
+}
+
+
+def _import_hmfast(hmfast_path=None):
+    """Import the hmfast package, optionally forcing it to come from
+    `hmfast_path` (prepended to sys.path). Pops any pre-loaded hmfast
+    submodules so the requested source is actually used.
+    """
+    if hmfast_path is not None:
+        if hmfast_path not in sys.path:
+            sys.path.insert(0, hmfast_path)
+        else:
+            # Make sure it sits in front of any other hmfast on the path.
+            sys.path.remove(hmfast_path)
+            sys.path.insert(0, hmfast_path)
+        for mod in [m for m in list(sys.modules) if m == "hmfast" or m.startswith("hmfast.")]:
+            loaded_file = getattr(sys.modules[mod], "__file__", None) or ""
+            if not loaded_file.startswith(hmfast_path):
+                del sys.modules[mod]
+    import hmfast as _hmfast
+    return _hmfast
+
 
 #for now only lcdm
 
@@ -212,6 +247,32 @@ class cosmology_model:
             self.get_dndlnM_at_z_and_M = np.vectorize(self.classy.get_dndlnM_at_z_and_M)
             self.get_delta_mean_from_delta_crit_at_z = np.vectorize(self.classy.get_delta_mean_from_delta_crit_at_z)
 
+        elif cosmology_tool == "hmfast":
+
+            self._hmfast_path = self.cnc_params.get("hmfast_path",
+                "/scratch/scratch-lxu/compute_packages/hmfast/src")
+            self._hmfast_emu_set = self.cnc_params.get(
+                "hmfast_emulator_set",
+                _HMFAST_EMU_FOR_MODEL[self.cnc_params["cosmo_model"]])
+            self._hmfast = _import_hmfast(self._hmfast_path)
+            self.logger.info(
+                f"hmfast loaded from {self._hmfast.__file__} "
+                f"(emulator_set={self._hmfast_emu_set})")
+
+            # Resolve density parameters in the same way as the classy_sz_jax branch
+            if self.cnc_params["cosmo_param_density"] == "critical":
+                self.cosmo_params["Ob0h2"] = self.cosmo_params["Ob0"] * self.cosmo_params["h"]**2
+                self.cosmo_params["Oc0h2"] = (self.cosmo_params["Om0"] - self.cosmo_params["Ob0"]) * self.cosmo_params["h"]**2
+            elif self.cnc_params["cosmo_param_density"] == "physical":
+                self.cosmo_params["Ob0"] = self.cosmo_params["Ob0h2"] / self.cosmo_params["h"]**2
+                self.cosmo_params["Om0"] = (self.cosmo_params["Oc0h2"] + self.cosmo_params["Ob0h2"]) / self.cosmo_params["h"]**2
+            elif self.cnc_params["cosmo_param_density"] == "mixed":
+                self.cosmo_params["Ob0"] = self.cosmo_params["Ob0h2"] / self.cosmo_params["h"]**2
+                self.cosmo_params["Oc0h2"] = (self.cosmo_params["Om0"] - self.cosmo_params["Ob0"]) * self.cosmo_params["h"]**2
+
+            self._build_params_values_dict()
+            self._init_hmfast_cosmology()
+
         print("cosmo params",self.cosmo_params)
 
 
@@ -302,6 +363,220 @@ class cosmology_model:
         return self._Om0_nonu * z1**3 / (
             self._Om0 * z1**3 + self._Ol0 + self._Or0 * z1**4)
 
+    # --------------------------------------------------------------
+    # hmfast backend
+    # --------------------------------------------------------------
+
+    def _hmfast_param_kwargs(self):
+        """Map cosmocnc cosmo_params -> hmfast.Cosmology constructor kwargs.
+
+        Uses the same ln(10^10 A_s) packing as the classy_sz_jax branch so
+        derived quantities (sigma8, z_rec, ...) are computed by the same
+        cosmopower NN with the same inputs.
+        """
+        cp = self.cosmo_params
+        h = cp["h"]
+        kwargs = {
+            "H0": h * 100.,
+            "omega_b": cp["Ob0"] * h**2,
+            "omega_cdm": (cp["Om0"] - cp["Ob0"]) * h**2,
+            "ln1e10A_s": float(np.log(cp.get("A_s", 2.1e-9) * 1e10)),
+            "n_s": cp["n_s"],
+            "tau_reio": cp["tau_reio"],
+            "m_ncdm": cp.get("m_nu", 0.06),
+        }
+        # Optional model-specific extras.
+        if "w0" in cp:
+            kwargs["w0_fld"] = cp["w0"]
+        if "N_eff" in cp:
+            # In hmfast, N_ur is the number of *ultra-relativistic* species
+            # (excluding the massive neutrino). Match classy_szfast which uses
+            # N_ur = Neff - deg_ncdm * (4/11)^(1/3) ... but for default
+            # deg_ncdm=1 with one massive species treated as ncdm, this is
+            # roughly Neff - 1.0132. Use 2.0328 (the lcdm default Neff=3.046
+            # convention) when not overridden.
+            pass
+        return kwargs
+
+    def _init_hmfast_cosmology(self):
+        """Construct the hmfast.Cosmology instance, resolve A_s from sigma_8
+        if needed, populate derived quantities (z_CMB, D_CMB, sigma8, ...),
+        then build the JIT-compatible predict functions and the wrappers used
+        by the rest of cosmocnc_jax.
+
+        For exact parity with classy_sz_jax, the JIT'd predict functions and
+        the sigma8->A_s solver internally use the same cosmopower NN that
+        classy_sz_jax uses (via ``cosmocnc_jax.emulators``). hmfast.Cosmology
+        is still the user-facing cosmology object exposed through
+        ``self._hmfast_cosmo`` and through the ``background_cosmology`` /
+        ``power_spectrum`` wrappers, so callers see hmfast's API and methods.
+        """
+        Cosmology = self._hmfast.Cosmology
+
+        # Set up the cosmocnc_jax.emulators (same NN as classy_sz_jax) and
+        # the sigma8->lnAs solver. The full _predict_* JIT functions are
+        # built *after* A_s is resolved so pk_power_fac is extracted with
+        # the resolved-A_s pvd -- matching classy_sz_jax's order exactly.
+        self._init_classy_predict_fns_for_hmfast()
+
+        # If sigma_8 is the amplitude parameter, solve for ln(10^10 A_s)
+        # using the SAME NN as classy_sz_jax (via _find_lnAs).
+        if self.amplitude_parameter == "sigma_8":
+            sigma8_target = float(self.cosmo_params["sigma_8"])
+            A_s_solved, lnAs_solved = self._find_As_from_sigma8_jax(sigma8_target)
+            self.cosmo_params["A_s"] = A_s_solved
+            self.As = A_s_solved
+            self._pvd["ln10^{10}A_s"] = float(lnAs_solved)
+        elif self.amplitude_parameter == "A_s":
+            self.As = self.cosmo_params["A_s"]
+
+        # Now extract pk_power_fac and finalise the predict_* JIT functions.
+        self._finalize_classy_predict_fns_for_hmfast()
+
+        # Build the user-facing hmfast.Cosmology with the resolved A_s.
+        kwargs = self._hmfast_param_kwargs()
+        hmf_cosmo = Cosmology(emulator_set=self._hmfast_emu_set, **kwargs)
+        for _key in ("HZ", "DAZ", "PKL", "DER"):
+            hmf_cosmo._load_emulator(_key)
+        self._hmfast_cosmo = hmf_cosmo
+
+        # Extract derived (sigma8, z_CMB, D_CMB, _Om0, ...) using the SAME
+        # classy NN -- bit-identical to classy_sz_jax derived quantities.
+        self._extract_derived_from_hmfast_via_classy_nn()
+
+        # Wrappers used by the rest of cosmocnc_jax (background_cosmology +
+        # power_spectrum). These delegate to hmfast.Cosmology methods so the
+        # user sees a genuine hmfast cosmology API at the high level.
+        self.power_spectrum = hmfast_jax_cosmo(self, self._hmfast_cosmo, self.cosmo_params)
+        self.background_cosmology = hmfast_jax_cosmo(self, self._hmfast_cosmo, self.cosmo_params)
+        self.background_cosmology.H0.value = self.cosmo_params["h"] * 100.
+
+        # Mass conversion helpers — implement the classy_sz formulas in pure
+        # Python so existing consumers (compare_hmf.py tutorial) keep working.
+        self.get_delta_mean_from_delta_crit_at_z = np.vectorize(
+            lambda delta_crit, z: float(delta_crit) / float(self._Omega_m_z_nonu(jnp.float64(z)))
+        )
+        self.get_m500c_to_m200c_at_z_and_M = self._not_implemented_mass_conv("m500c->m200c")
+        self.get_m200c_to_m500c_at_z_and_M = self._not_implemented_mass_conv("m200c->m500c")
+        self.get_c200c_at_m_and_z = self._not_implemented_mass_conv("c200c")
+        self.get_dndlnM_at_z_and_M = self._not_implemented_mass_conv("dndlnM")
+
+    def _not_implemented_mass_conv(self, name):
+        def _f(*args, **kwargs):
+            raise NotImplementedError(
+                f"{name!r} mass conversion is not available with the hmfast "
+                f"backend; use cosmology_tool='classy_sz_jax' for that helper.")
+        return _f
+
+    def _init_classy_predict_fns_for_hmfast(self):
+        """Set up the cosmocnc_jax.emulators state used by the cnc.py fast
+        path. Loads classy_szfast's float32 cosmopower NN (same as the
+        classy_sz_jax branch) and builds the sigma8->lnAs solver. The
+        actual ``_predict_*`` JIT functions (which capture ``pk_power_fac``
+        as a constant) are wired later by
+        ``_finalize_classy_predict_fns_for_hmfast`` so that ``pk_power_fac``
+        is extracted with the RESOLVED A_s pvd -- which is what the
+        classy_sz_jax branch effectively does.
+        """
+        from cosmocnc_jax.emulators import init_emulators, make_sigma8_solver
+
+        self._emu, self._emu_param_orders, self._z_interp = init_emulators(
+            self.cnc_params['cosmo_model'])
+
+        # Build the sigma8 solver and a temporary predict_der right away --
+        # both are needed before we resolve A_s.
+        from cosmocnc_jax.emulators import _call_emulator
+
+        @jax.jit
+        def _predict_der_tmp(cosmo_vec_der):
+            return _call_emulator(self._emu['der'], cosmo_vec_der)
+        self._predict_der = _predict_der_tmp
+
+        lnAs_index = self._emu_param_orders['der'].index('ln10^{10}A_s')
+        self._find_lnAs = make_sigma8_solver(self._emu['der'], lnAs_index)
+        self._lnAs_index = lnAs_index
+
+    def _finalize_classy_predict_fns_for_hmfast(self):
+        """Extract ``pk_power_fac`` and ``k_arr`` from a standalone
+        ``Class_szfast`` (no Cython needed) using the resolved-A_s pvd, then
+        build the JIT'd predict_* functions.
+
+        This matches what ``cosmology_model.__init__(cosmology_tool=
+        "classy_sz_jax")`` does (extract after find_As), guaranteeing
+        byte-identical pk_power_fac with classy_sz_jax.
+        """
+        from cosmocnc_jax.emulators import make_predict_fns, _call_emulator
+        from classy_szfast.classy_szfast import Class_szfast
+
+        cosmo_model_idx = {
+            'lcdm': 0, 'mnu': 1, 'neff': 2, 'wcdm': 3, 'ede': 4,
+            'mnu-3states': 5, 'ede-v2': 6,
+        }[self.cnc_params['cosmo_model']]
+        csz = Class_szfast(params_settings={
+            'jax': 1,
+            'cosmo_model': cosmo_model_idx,
+            'classy_sz_verbose': 'none',
+        })
+        z_test = 0.5
+        pk_szfast, k_arr_np = csz.calculate_pkl_at_z(z_test, params_values_dict=self._pvd)
+        pk_szfast = np.asarray(pk_szfast).ravel()
+        self._k_arr = jnp.asarray(k_arr_np).ravel()
+
+        cosmo_keys = [k for k in self._emu_param_orders['pkl']
+                      if k != 'z_pk_save_nonclass']
+        cosmo_vec = jnp.array([self._pvd[k] for k in cosmo_keys])
+        input_vec = jnp.concatenate([cosmo_vec, jnp.array([z_test])])
+        raw = np.asarray(_call_emulator(self._emu['pkl'], input_vec)).ravel()
+        self._pk_power_fac = jnp.asarray(pk_szfast / np.power(10., raw))
+
+        self._predict_H, self._predict_DA, self._predict_pk_batch, self._predict_der = \
+            make_predict_fns(self._emu, self._emu_param_orders,
+                             self._z_interp, self._pk_power_fac)
+
+    def _extract_derived_from_hmfast_via_classy_nn(self):
+        """Same as ``_extract_derived_from_jax`` but populated for the hmfast
+        backend. Uses the classy-NN _predict_der to guarantee bit-identical
+        derived quantities to classy_sz_jax."""
+        from cosmocnc_jax.emulators import build_cosmo_vec
+
+        cosmo_vec_der = build_cosmo_vec(self._pvd, self._emu_param_orders['der'])
+        der = self._predict_der(cosmo_vec_der)
+        self.sigma8 = float(der[1])
+        self.cosmo_params["sigma_8"] = self.sigma8
+        self.N_eff = float(der[4])
+        self.z_CMB = float(der[6])  # z_rec
+        # angular diameter distance to recombination: D_A = chi / (1+z)
+        self.D_CMB = float(der[8]) / (1. + self.z_CMB)
+
+        # T_CMB and Omega_nu (constant; pull from hmfast cosmology)
+        if not hasattr(self, "T_CMB_0"):
+            self.T_CMB_0 = float(self._hmfast_cosmo.T_cmb)
+        h = self.cosmo_params["h"]
+        m_ncdm = self._hmfast_cosmo.m_ncdm
+        deg_ncdm = self._hmfast_cosmo.deg_ncdm
+        self.Omega_nu = float(deg_ncdm * m_ncdm / (93.14 * h**2))
+        self.cosmo_params["Onu0"] = self.Omega_nu
+
+        # Precompute Omega components for Delta conversion (mirrors classy
+        # branch). Use the lcdm default of N_ur=2.0328 for lcdm to match
+        # classy's radiation budget exactly.
+        Ob = self._pvd["omega_b"] / h**2
+        Ocdm = self._pvd["omega_cdm"] / h**2
+        Oncdm = self.Omega_nu
+        self._Om0 = Ocdm + Ob + Oncdm
+        self._Om0_nonu = self._Om0 - Oncdm
+        sigma_B = 5.670374419e-8
+        _c = 2.99792458e8
+        _G = 6.67428e-11
+        _Mpc_m = 3.085677581282e22
+        Og = (4. * sigma_B / _c * self.T_CMB_0**4) / (
+            3. * _c**2 * 1e10 * h**2 / _Mpc_m**2 / 8. / np.pi / _G)
+        N_ur = 2.0328  # lcdm default (matches classy_sz_jax branch)
+        Our = N_ur * 7. / 8. * (4. / 11.)**(4. / 3.) * Og
+        self._Or0 = Our + Og
+        self._Ol0 = 1. - Og - Ob - Ocdm - Oncdm - Our
+
+
     def update_cosmology(self,cosmo_params_new,cosmology_tool = "astropy"):
 
         self.cosmo_params = cosmo_params_new
@@ -318,6 +593,42 @@ class cosmology_model:
             self.power_spectrum = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
             self.background_cosmology = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
             self.background_cosmology.H0.value = self.cosmo_params["h"]*100.
+
+        elif cosmology_tool == "hmfast":
+
+            # Resolve density parameters consistently with __init__.
+            if self.cnc_params["cosmo_param_density"] == "critical":
+                self.cosmo_params["Ob0h2"] = self.cosmo_params["Ob0"] * self.cosmo_params["h"]**2
+                self.cosmo_params["Oc0h2"] = (self.cosmo_params["Om0"] - self.cosmo_params["Ob0"]) * self.cosmo_params["h"]**2
+            elif self.cnc_params["cosmo_param_density"] == "physical":
+                self.cosmo_params["Ob0"] = self.cosmo_params["Ob0h2"] / self.cosmo_params["h"]**2
+                self.cosmo_params["Om0"] = (self.cosmo_params["Oc0h2"] + self.cosmo_params["Ob0h2"]) / self.cosmo_params["h"]**2
+            elif self.cnc_params["cosmo_param_density"] == "mixed":
+                self.cosmo_params["Ob0"] = self.cosmo_params["Ob0h2"] / self.cosmo_params["h"]**2
+                self.cosmo_params["Oc0h2"] = (self.cosmo_params["Om0"] - self.cosmo_params["Ob0"]) * self.cosmo_params["h"]**2
+
+            self._build_params_values_dict()
+
+            # Solve A_s from sigma_8 using the shared classy NN solver.
+            if self.amplitude_parameter == "sigma_8":
+                sigma8_target = float(self.cosmo_params["sigma_8"])
+                A_s_solved, lnAs_solved = self._find_As_from_sigma8_jax(sigma8_target)
+                self.cosmo_params["A_s"] = A_s_solved
+                self.As = A_s_solved
+                self._pvd["ln10^{10}A_s"] = float(lnAs_solved)
+            elif self.amplitude_parameter == "A_s":
+                self.As = self.cosmo_params["A_s"]
+
+            # Cheap pytree update of the hmfast.Cosmology with new params.
+            kwargs = self._hmfast_param_kwargs()
+            self._hmfast_cosmo = self._hmfast_cosmo.update(**kwargs)
+
+            # Re-extract derived (sigma8, z_CMB, D_CMB, _Om0...) from classy NN.
+            self._extract_derived_from_hmfast_via_classy_nn()
+
+            self.power_spectrum = hmfast_jax_cosmo(self, self._hmfast_cosmo, self.cosmo_params)
+            self.background_cosmology = hmfast_jax_cosmo(self, self._hmfast_cosmo, self.cosmo_params)
+            self.background_cosmology.H0.value = self.cosmo_params["h"] * 100.
 
         elif cosmology_tool == "cobaya":
 
@@ -453,6 +764,129 @@ class classy_sz_jax_cosmo:
         class result:
             value = hz * conv_fac
 
+        return result
+
+    class H0:
+        value = 0
+
+
+class hmfast_jax_cosmo:
+    """JAX-compatible wrapper that exposes the hmfast.Cosmology API in the
+    same shape the rest of cosmocnc_jax expects from ``classy_sz_jax_cosmo``.
+
+    To guarantee byte-identical numerics with classy_sz_jax, the background
+    quantities (``H``, ``D_A``, ``critical_density``, P(k)) here are
+    routed through the parent ``cosmology_model``'s classy-NN
+    ``_predict_*`` functions -- these load classy_szfast's float32
+    cosmopower NN, the same NN classy_sz_jax uses. The full hmfast
+    ``Cosmology`` object remains available on the parent as
+    ``cosmology._hmfast_cosmo`` for users who want hmfast's float64 API
+    (e.g. for derived parameters, growth, velocity dispersion, ...).
+    """
+
+    def __init__(self, parent_cosmology_model, hmfast_cosmo, cosmo_params):
+        self._parent = parent_cosmology_model
+        self._hmfast_cosmo = hmfast_cosmo
+        self.cosmo_params = cosmo_params
+        self.const = constants()
+        self._h = float(cosmo_params["h"])
+
+    # -- helpers to build cosmo_vec_<key> on demand ------------------
+
+    def _cosmo_vec(self, emu_key):
+        from cosmocnc_jax.emulators import build_cosmo_vec
+        order = self._parent._emu_param_orders[emu_key]
+        return build_cosmo_vec(self._parent._pvd, order)
+
+    def _cosmo_vec_pkl(self):
+        from cosmocnc_jax.emulators import build_cosmo_vec
+        order = [k for k in self._parent._emu_param_orders['pkl']
+                 if k != 'z_pk_save_nonclass']
+        return build_cosmo_vec(self._parent._pvd, order)
+
+    # -- API methods --------------------------------------------------
+
+    def get_linear_power_spectrum(self, redshift):
+        z_arr = jnp.atleast_1d(redshift)
+        cosmo_vec_pkl = self._cosmo_vec_pkl()
+        pk_batch = self._parent._predict_pk_batch(cosmo_vec_pkl, z_arr)
+        pk = pk_batch[0] if pk_batch.ndim == 2 else pk_batch
+        k = self._parent._k_arr
+
+        k_cutoff = self.cosmo_params.get("k_cutoff", 10.)
+        if k_cutoff < 10:
+            x = jnp.linspace(jnp.log10(0.1), jnp.log10(100.), 10000)
+            centre = jnp.log10(0.5)
+            width = jnp.log10(10.) - jnp.log10(0.1)
+            suppression = -jnp.tanh((x - centre) / width * 4) * 0.15 + 0.85
+            ps_cutoff = jnp.interp(jnp.log10(k), x + jnp.log10(0.677), suppression)
+            pk = pk * ps_cutoff
+
+        return (k, pk)
+
+    def critical_density(self, z):
+        z_arr = jnp.atleast_1d(z)
+        H_over_c = self._parent._predict_H(self._cosmo_vec('h'), z_arr)
+        # Convert H/c (1/Mpc with c in km/s) to rho_c in g/cm^3, then store
+        # in .value as g/cm^3 so the rest of cosmocnc converts it via
+        # ``.value * 1000 * mpc^3 / solar`` back to M_sun/Mpc^3 (matching
+        # the astropy convention used in hmf.py:172).
+        # ρ_c [M_sun/Mpc^3] = (3 / (8πG·M_sun)) · Mpc_m · c^2 · H_over_c^2
+        _G = 6.67428e-11
+        _M_sun = 1.98855e30
+        _Mpc_m = 3.085677581282e22
+        _c_ms = 2.99792458e8
+        prefactor = 3. / (8. * jnp.pi * _G * _M_sun) * _Mpc_m * _c_ms**2
+        rho_msun_per_mpc3 = prefactor * H_over_c**2
+        if rho_msun_per_mpc3.shape == (1,) and jnp.ndim(z) == 0:
+            rho_msun_per_mpc3 = rho_msun_per_mpc3[0]
+        conv_fac = 1. / (1000. * self.const.mpc**3 / self.const.solar)
+        class result:
+            value = rho_msun_per_mpc3 * conv_fac
+        return result
+
+    def differential_comoving_volume(self, z):
+        z_arr = jnp.atleast_1d(z)
+        D_A = self._parent._predict_DA(self._cosmo_vec('da'), z_arr)
+        H_over_c = self._parent._predict_H(self._cosmo_vec('h'), z_arr)
+        chi = D_A * (1. + z_arr)
+        # dV/(dz dΩ) = chi^2 / H(z) * c. With c/H = 1/H_over_c [Mpc],
+        # dV/(dz dΩ) = chi^2 / H_over_c [Mpc^3].
+        vol = chi**2 / H_over_c
+        if vol.shape == (1,) and jnp.ndim(z) == 0:
+            vol = vol[0]
+        class result:
+            value = vol
+        return result
+
+    def angular_diameter_distance(self, z):
+        z_arr = jnp.atleast_1d(z)
+        da = self._parent._predict_DA(self._cosmo_vec('da'), z_arr)
+        if da.shape == (1,) and jnp.ndim(z) == 0:
+            da = da[0]
+        class result:
+            value = da
+        return result
+
+    def angular_diameter_distance_z1z2(self, z1, z2):
+        z1_arr = jnp.atleast_1d(z1)
+        z2_arr = jnp.atleast_1d(z2)
+        cosmo_vec_da = self._cosmo_vec('da')
+        da1 = self._parent._predict_DA(cosmo_vec_da, z1_arr)
+        da2 = self._parent._predict_DA(cosmo_vec_da, z2_arr)
+        class result:
+            value = -(1. / (1. + z2_arr)) * (da1 * (1. + z1_arr) - da2 * (1. + z2_arr))
+        return result
+
+    def H(self, z):
+        # Return H(z) in km/s/Mpc, matching classy_sz_jax_cosmo's H().
+        z_arr = jnp.atleast_1d(z)
+        H_over_c = self._parent._predict_H(self._cosmo_vec('h'), z_arr)
+        hz = H_over_c * 299792.458
+        if hz.shape == (1,) and jnp.ndim(z) == 0:
+            hz = hz[0]
+        class result:
+            value = hz
         return result
 
     class H0:

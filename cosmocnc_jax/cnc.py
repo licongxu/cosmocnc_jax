@@ -1657,12 +1657,16 @@ class cluster_number_counts:
         gamma = constants().gamma
 
         # Build cosmo quantities dict for prefactor computation
+        _cp = self.cosmo_params
         cosmo_q = {
             "E_z": self.E_z, "H0": jnp.float64(H0),
             "D_A": self.D_A, "D_CMB": jnp.float64(self.cosmology.D_CMB),
             "D_l_CMB": self.D_l_CMB, "rho_c": self.rho_c,
             "gamma": jnp.float64(gamma),
             "z": self.redshift_vec,
+            # Used by DMB survey SR (ignored by GNFW power-law modules)
+            "omega_b": jnp.float64(_cp.get("Ob0", _cp.get("Omega_b", 0.04897))),
+            "omega_m": jnp.float64(_cp.get("Om0", _cp.get("Omega_m", 0.315))),
         }
 
         # Compute prefactors for all redshifts (vmapped)

@@ -94,6 +94,15 @@ cnc_params_default = {
     "class_sz_use_m500c_in_ym_relation": 1,
     "class_sz_use_m200c_in_ym_relation": 0,
 
+    # hmfast backend (used only when cosmology_tool == "hmfast"):
+    #   "hmfast_emulator_set" picks the hmfast Cosmology emulator set,
+    #   "hmfast_path" forces import of the hmfast package from a specific
+    #   source path (prepended to sys.path) so an environment-installed
+    #   hmfast doesn't shadow the intended one. Set to None to use whatever
+    #   "import hmfast" resolves to.
+    "hmfast_emulator_set": "lcdm:v1",
+    "hmfast_path": "/scratch/scratch-lxu/compute_packages/hmfast/src",
+
     #Redshift errors parameters
 
     "z_errors": False,

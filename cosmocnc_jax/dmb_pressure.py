@@ -391,3 +391,50 @@ def central_y0_m500_packed(
         dmb_c200c=dmb_c200c,
     )
     return central_y0_m500(m500_phys, z, omega_b, omega_m, h, params)
+
+
+@partial(jax.jit, static_argnames=("nfw_trunc", "num_points_trapz_int", "chunk_size"))
+def central_y0_m500_vmap(
+    m500_phys,
+    z,
+    omega_b,
+    omega_m,
+    h,
+    packed_dmb,
+    nfw_trunc=True,
+    num_points_trapz_int=64,
+    dmb_c200c=jnp.nan,
+    chunk_size=128,
+):
+    """Batched central y0 over a 1D mass array (GPU-friendly, memory-capped).
+
+    Uses chunked ``vmap`` over mass so an outer redshift ``vmap`` (CNC
+    abundance) does not fuse into a giant ``(n_z, n_M, n_r, …)`` kernel —
+    that fusion OOM'd at ``n_points=4096`` under a 10% GPU memory fraction.
+    Within each chunk, halos still run in parallel (hmfast-style).
+    """
+    params = unpack_dmb_params(
+        packed_dmb,
+        nfw_trunc=nfw_trunc,
+        num_points_trapz_int=num_points_trapz_int,
+        dmb_c200c=dmb_c200c,
+    )
+
+    def one(m):
+        return central_y0_m500(m, z, omega_b, omega_m, h, params)
+
+    m500_phys = jnp.atleast_1d(m500_phys)
+    n = m500_phys.shape[0]
+    # Pad to a multiple of chunk_size for lax.scan.
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    pad = n_chunks * chunk_size - n
+    m_pad = jnp.concatenate(
+        [m500_phys, jnp.full((pad,), m500_phys[-1], dtype=m500_phys.dtype)]
+    )
+    m_chunks = m_pad.reshape(n_chunks, chunk_size)
+
+    def body(_, mc):
+        return None, jax.vmap(one)(mc)
+
+    _, y_chunks = jax.lax.scan(body, None, m_chunks)
+    return y_chunks.reshape(-1)[:n]

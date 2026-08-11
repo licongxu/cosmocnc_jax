@@ -29,6 +29,7 @@ from cosmocnc_jax.dmb_pressure import (
     DMB_PARAM_KEYS,
     pack_dmb_params,
     central_y0_m500,
+    central_y0_m500_vmap,
     dmb_params_from_sr,
 )
 
@@ -220,16 +221,17 @@ class scaling_relations:
 
             def layer0(x0, z, omega_b, omega_m, h, pref_theta,
                        sigma_sz_poly, bias_sz, *dmb_packed):
-                params = {k: dmb_packed[i] for i, k in enumerate(DMB_PARAM_KEYS)}
-                params["nfw_trunc"] = nfw_trunc
-                params["num_points_trapz_int"] = n_trapz
-                params["dmb_c200c"] = jnp.nan
+                # Chunked JIT/vmap over mass (parallel within chunk; avoids
+                # fusing with outer redshift vmap into a huge memory kernel).
                 m500 = bias_sz * 1.0e14 * jnp.exp(x0)
-
-                def y0_one(m):
-                    return central_y0_m500(m, z, omega_b, omega_m, h, params)
-
-                y0 = jax.vmap(y0_one)(m500)
+                chunk = int(self.cnc_params.get("dmb_y0_chunk_size", 128))
+                y0 = central_y0_m500_vmap(
+                    m500, z, omega_b, omega_m, h, dmb_packed,
+                    nfw_trunc=nfw_trunc,
+                    num_points_trapz_int=n_trapz,
+                    dmb_c200c=jnp.nan,
+                    chunk_size=chunk,
+                )
                 log_y0 = jnp.log(jnp.maximum(y0, 1e-30))
                 log_theta_500 = jnp.log(pref_theta) + x0 / 3.
                 log_sigma_sz = jnp.polyval(sigma_sz_poly, log_theta_500)

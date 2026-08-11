@@ -20,3 +20,12 @@ Thumbs.db
 
 # Test outputs
 tests/*.png
+
+# Claude Code — local configuration, skills, credentials, and worktrees
+.claude/
+
+# MCMC chain outputs (local Cobaya runs)
+tutorials/chains/
+
+# Generated tutorial plots
+tutorials/*.png

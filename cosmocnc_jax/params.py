@@ -269,6 +269,39 @@ scaling_relation_params_default = {
 "lnb_wl_sigma": 0., #prior: unit standard deviation, mean 0
 "b_wl_m": 1.029,
 "s_wl_m": -0.226,
+
+# DMB / BCM_18_wP pressure → central y0 (survey_sr_*_dmb only; unused by GNFW power-law path)
+"theta_ej_0": 4.0,
+"log10_Mstar0_theta_ej": 14.0,
+"nu_theta_ej_M": 0.0,
+"nu_theta_ej_z": 0.0,
+"nu_theta_ej_c": 0.0,
+"theta_co_0": 0.1,
+"log10_Mstar0_theta_co": 14.0,
+"nu_theta_co_M": 0.0,
+"nu_theta_co_z": 0.0,
+"nu_theta_co_c": 0.0,
+"mu_beta": 0.21,
+"eta_star": 0.3,
+"eta_cga": 0.6,
+"A_starcga": 0.09,
+"log10_M1_starcga": 11.4,
+"epsilon_rt": 4.0,
+"log10_Mc0": 14.83,
+"nu_z": 0.0,
+"nu_M": 0.0,
+"log10_Mstar0": 13.0,
+"a_zeta": 0.3,
+"n_zeta": 2.0,
+"alpha_nt": 0.18,
+"beta_nt": 0.5,
+"n_nt": 0.3,
+"gamma_rhogas": 2.0,
+"delta_rhogas": 7.0,
+"nfw_trunc": True,
+"num_points_trapz_int": 64,
+# NaN → Duffy 2008 c200c(M,z); set a float to fix concentration
+"dmb_c200c": float("nan"),
 }
 
 cosmo_params_default = {

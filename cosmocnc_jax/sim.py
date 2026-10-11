@@ -100,8 +100,22 @@ def get_samples_pdf_jax(key, n_samples, x, cpdf):
     return x_samples
 
 
+def _padded_size(n):
+    """Round n up to a power of two (>= 1024) so the jitted samplers compile O(log n) times, not once per n."""
+    n = int(n)
+    if n < 0:
+        raise ValueError("n_samples must be non-negative")
+    return max(1024, 1 << (n - 1).bit_length())
+
+
 def get_samples_pdf_2d_jax(key, n_samples, x, y, pdf):
     """2D inverse CDF sampling using JAX with logit-space interpolation."""
+    x_samples, y_samples = _sample_pdf_2d_logit(key, _padded_size(n_samples), x, y, pdf)
+    return (x_samples[:n_samples], y_samples[:n_samples])
+
+
+@partial(jax.jit, static_argnums=(1,))
+def _sample_pdf_2d_logit(key, n_samples, x, y, pdf):
     key1, key2 = jrandom.split(key)
 
     eps = 1e-12
@@ -110,9 +124,10 @@ def get_samples_pdf_2d_jax(key, n_samples, x, y, pdf):
     col_max = jnp.max(cpdf_xgy, axis=0, keepdims=True)
     cpdf_xgy = cpdf_xgy / jnp.where(col_max > 0., col_max, 1.)
 
-    cpdf_y = jnp.cumsum(jnp.sum(pdf, axis=0)) * (y[1] - y[0]) * (x[1] - x[0])
-
-    y_samples = get_samples_pdf_jax(key1, n_samples, y, cpdf_y)
+    # Match the benchmark's 65536-point marginal CDF without enlarging the 2D HMF grid.
+    y_cdf = jnp.linspace(y[0], y[-1], max(65536, len(y)))
+    cpdf_y = jnp.cumsum(jnp.interp(y_cdf, y, jnp.sum(pdf, axis=0)))
+    y_samples = get_samples_pdf_jax(key1, n_samples, y_cdf, cpdf_y)
 
     # Build logit-space grid for interpolation
     wmin = jnp.log(eps) - jnp.log1p(-eps)
@@ -157,6 +172,12 @@ def get_samples_pdf_2d_jax(key, n_samples, x, y, pdf):
 
 def sample_lonlat_jax(key, n_clusters):
     """Sample uniform longitude and latitude on the sphere using JAX."""
+    lon, lat = _sample_lonlat_jit(key, _padded_size(n_clusters))
+    return lon[:n_clusters], lat[:n_clusters]
+
+
+@partial(jax.jit, static_argnums=(1,))
+def _sample_lonlat_jit(key, n_clusters):
     key1, key2 = jrandom.split(key)
     lon = 2. * jnp.pi * jrandom.uniform(key1, (n_clusters,))
     lat = jnp.arccos(2. * jrandom.uniform(key2, (n_clusters,)) - 1.)
